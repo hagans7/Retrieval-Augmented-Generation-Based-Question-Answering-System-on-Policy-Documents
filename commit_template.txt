@@ -1,0 +1,49 @@
+[<type>, <scope>] <Short summary in one sentence>
+(Describe briefly what this commit does — keep it concise and meaningful.)
+
+Detailed Description (optional but recommended):
+- Explain *why* this change is needed.
+- Provide additional context, reasoning, or implementation notes.
+- Focus on clarity — explain intent more than code details.
+
+Changes Included:
+* <High-level action 1>:
+    - <Specific change 1>
+    - <Specific change 2>
+* <High-level action 2> (optional):
+    - <Specific change 3>
+    - <Specific change 4>
+
+Related Issues / References (optional):
+- Issue: #<id>
+- Link: <URL or documentation reference>
+
+---
+
+# Examples:
+
+# [dev, api] Add base API entry point
+#
+# Detailed Description:
+# - Starting point for backend API functionality.
+# - Prepares project structure for upcoming endpoints.
+#
+# Changes Included:
+# * Add main entry file:
+#     - create `backend/api/main.py`
+#     - initialize FastAPI app instance
+# * Project structure setup:
+#     - add `__init__.py` for module recognition
+#
+# Related Issues:
+# - Issue: #12
+
+# ---------------------------------------------
+# Valid types for <type> (recommendation):
+# feat  : new feature
+# fix   : bug fix
+# ref   : refactor / code re-organization
+# docs  : documentation changes
+# test  : testing updates
+# chore : non-code change (config/CI/build)
+# ---------------------------------------------
