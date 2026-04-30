@@ -221,7 +221,7 @@ curl http://localhost:8000/health/readiness
 # {"status": "ready", "checks": {"database": true, "redis": true, "ocr_model": true}}
 ```
 
-# Create MinIO bucket
+### Create MinIO bucket
 ```bash
 docker compose exec minio mc alias set local http://localhost:9000 minioadmin minioadmin
 docker compose exec minio mc mb local/legal-docs
