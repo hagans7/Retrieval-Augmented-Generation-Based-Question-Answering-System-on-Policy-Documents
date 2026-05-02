@@ -22,9 +22,8 @@ class CypherBuilder:
         Returns:
             Parameterized Cypher string. Parameters: {name, properties}.
         """
-        clean_type = entity_type.replace(" ", "_").replace("-", "_")
         return (
-            f"MERGE (n:{clean_type} {{canonical_name: $name}}) "
+            f"MERGE (n:{entity_type} {{canonical_name: $name}}) "
             f"ON CREATE SET n += $properties, n.created_at = datetime() "
             f"ON MATCH SET n += $properties, n.updated_at = datetime() "
             f"RETURN n"
@@ -38,18 +37,24 @@ class CypherBuilder:
         Returns:
             Parameterized Cypher. Parameters: {from_name, to_name, rel_type, properties}.
         """
-        
         return (
-            "MATCH (a {canonical_name: $from_name}) "
-            "MATCH (b {canonical_name: $to_name}) "
-                "CALL apoc.merge.relationship(a, $rel_type, {}, $properties, b) "
-                "YIELD rel RETURN rel"
+            "MATCH (a {canonical_name: $from_name}), (b {canonical_name: $to_name}) "
+            "CALL apoc.merge.relationship(a, $rel_type, {}, $properties, b) "
+            "YIELD rel RETURN rel"
         )
 
     @staticmethod
     def multi_hop_path(max_hops: int) -> str:
         """
         Build a variable-length path query from a starting entity.
+
+        Returns node properties and relationships as plain dicts — not raw
+        Neo4j objects. This avoids the AttributeError caused by result.data()
+        converting Relationship objects to tuples.
+
+        Relationships are projected inline as maps:
+          {type, start_id, end_id, properties}
+        Nodes are projected as their full property map.
 
         Args:
             max_hops: Maximum traversal depth.
@@ -60,7 +65,14 @@ class CypherBuilder:
         return (
             f"MATCH path = (start {{canonical_name: $start_name}})"
             f"-[*1..{max_hops}]-(related) "
-            f"RETURN nodes(path) as nodes, relationships(path) as rels, "
-            f"length(path) as path_length "
+            f"RETURN "
+            f"[n IN nodes(path) | properties(n)] AS nodes, "
+            f"[r IN relationships(path) | {{"
+            f"  type: type(r), "
+            f"  start_id: toString(id(startNode(r))), "
+            f"  end_id: toString(id(endNode(r))), "
+            f"  properties: properties(r)"
+            f"}}] AS rels, "
+            f"length(path) AS path_length "
             f"LIMIT 50"
         )
