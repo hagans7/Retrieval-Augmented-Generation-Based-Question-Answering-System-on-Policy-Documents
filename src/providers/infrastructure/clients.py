@@ -15,6 +15,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 from src.core.config.settings import settings
+from src.core.logging.logger import get_logger
 from src.interfaces.clients.base_cache_client import BaseCacheClient
 from src.interfaces.clients.base_embedding_client import BaseEmbeddingClient
 from src.interfaces.clients.base_graph_client import BaseGraphClient
@@ -22,7 +23,11 @@ from src.interfaces.clients.base_llm_client import BaseLLMClient
 from src.interfaces.clients.base_ocr_client import BaseOCRClient
 from src.interfaces.clients.base_reranker_client import BaseRerankerClient
 from src.interfaces.clients.base_storage_client import BaseStorageClient
+from src.interfaces.clients.base_observability_client import BaseObservabilityClient
 from src.interfaces.clients.base_vector_store_client import BaseVectorStoreClient
+
+
+logger = get_logger(__name__)
 
 
 @lru_cache(maxsize=1)
@@ -125,3 +130,37 @@ def get_ocr_client() -> BaseOCRClient:
         model_dir=settings.OCR_MODEL_DIR,
         hf_token=settings.HF_TOKEN,
     )
+
+@lru_cache(maxsize=1)
+def get_observability_client() -> BaseObservabilityClient:
+    """
+    Return the singleton observability client.
+
+    Selects implementation based on settings:
+      - LangfuseObservabilityClient when LANGFUSE keys are present
+      - NoOpObservabilityClient when keys are absent (dev / test)
+
+    Return type is always BaseObservabilityClient — callers never
+    depend on the concrete class.
+
+    NOTE: settings is imported at module level (not inside this function)
+    so that tests can patch it via:
+        patch("src.providers.infrastructure.clients.settings")
+    """
+    if settings.LANGFUSE_SECRET_KEY and settings.LANGFUSE_PUBLIC_KEY:
+        try:
+            from src.core.observability.langfuse_client import LangfuseObservabilityClient
+            return LangfuseObservabilityClient(
+                public_key=settings.LANGFUSE_PUBLIC_KEY,
+                secret_key=settings.LANGFUSE_SECRET_KEY,
+                host=settings.LANGFUSE_HOST,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Langfuse init failed, falling back to no-op",
+                extra={"error": str(exc)},
+            )
+
+    logger.info("Observability disabled — using no-op client")
+    from src.core.observability.noop_client import NoOpObservabilityClient
+    return NoOpObservabilityClient()
