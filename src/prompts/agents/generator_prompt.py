@@ -40,7 +40,7 @@ ATURAN WAJIB:
 * JANGAN menambahkan fakta dari luar evidence
 * JANGAN mengarang atau mengisi kekosongan
 
-═══════════════════════════════════════════════════════
+════════════════\═══════════════════════════════════════
 PERILAKU BERDASARKAN KONDISI:
 ═══════════════════════════════════════════════════════
 
