@@ -74,40 +74,6 @@ class Neo4jGraphClient(BaseGraphClient):
                 context={"count": len(entities), "error": str(exc)},
             ) from exc
 
-        
-    # async def upsert_relations(self, relations: list[dict]) -> None:
-    #     """
-    #     Upsert relations between entities.
-
-    #     Each dict must have: from_entity, to_entity, relation_type.
-
-    #     Raises:
-    #         GraphQueryError: If the operation fails.
-    #     """
-    #     if not relations or not self._driver:
-    #         return
-    #     try:
-    #         async with self._driver.session() as session:
-    #             async with await session.begin_transaction() as tx:
-    #                 for rel in relations:
-    #                     query = CypherBuilder.upsert_relation()
-    #                     await tx.run(
-    #                         query,
-    #                         from_name=rel["from_entity"],
-    #                         to_name=rel["to_entity"],
-    #                         rel_type=rel["relation_type"],
-    #                         properties={
-    #                             k: v for k, v in rel.items()
-    #                             if k not in ("from_entity", "to_entity", "relation_type")
-    #                         },
-    #                     )
-    #                 await tx.commit()
-    #     except Exception as exc:
-    #         raise GraphQueryError(
-    #             message="Failed to upsert relations.",
-    #             context={"count": len(relations), "error": str(exc)},
-    #         ) from exc
-
     async def upsert_relations(self, relations: list[dict]) -> None:
         """
         Upsert relations between entities.
@@ -166,7 +132,8 @@ class Neo4jGraphClient(BaseGraphClient):
             query = CypherBuilder.multi_hop_path(max_hops)
             async with self._driver.session() as session:
                 result = await session.run(query, start_name=start_entity)
-                records = await result.data()
+                # records = await result.data()
+                records = [record async for record in result]
             return GraphResultMapper.map_path_results(records)
         except Exception as exc:
             raise GraphQueryError(

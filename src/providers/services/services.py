@@ -14,6 +14,7 @@ from src.providers.infrastructure.clients import (
     get_embedding_client,
     get_graph_client,
     get_llm_client,
+    get_observability_client,
     get_ocr_client,
     get_reranker_client,
     get_storage_client,
@@ -42,6 +43,7 @@ def get_process_chat_service(db: AsyncSession = Depends(get_db_session)):
         embedding_client=get_embedding_client(),
         reranker_client=get_reranker_client(),
         cache_client=get_cache_client(),
+        observability_client=get_observability_client(),
     )
 
 

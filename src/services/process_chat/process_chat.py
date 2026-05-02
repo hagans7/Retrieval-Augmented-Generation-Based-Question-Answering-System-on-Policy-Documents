@@ -25,6 +25,7 @@ from src.core.config.settings import settings
 from src.core.logging.logger import get_logger
 from src.entities.chat_result.chat_result import ChatResult
 from src.interfaces.clients.base_cache_client import BaseCacheClient
+from src.interfaces.clients.base_observability_client import BaseObservabilityClient
 from src.interfaces.clients.base_embedding_client import BaseEmbeddingClient
 from src.interfaces.clients.base_graph_client import BaseGraphClient
 from src.interfaces.clients.base_llm_client import BaseLLMClient
@@ -150,6 +151,7 @@ class ProcessChatService:
         embedding_client: BaseEmbeddingClient,
         reranker_client: BaseRerankerClient,
         cache_client: BaseCacheClient,
+        observability_client: BaseObservabilityClient | None = None,
     ) -> None:
         self._conv_repo = conversation_repo
         self._message_repo = message_repo
@@ -168,6 +170,7 @@ class ProcessChatService:
             graph_client=graph_client,
             embedding_client=embedding_client,
             reranker_client=reranker_client,
+            observability_client=observability_client,
         )
 
     async def execute(
@@ -262,37 +265,37 @@ class ProcessChatService:
         )
 
     async def _execute_stream(self, context, correlation_id: str) -> AsyncIterator:
-        from src.core.constants.agent import (
-            AUDITOR_NODE, EXECUTOR_NODE, GENERATOR_NODE, PLANNER_NODE, ROUTER_NODE,
-        )
+        """
+        Stream execution path.
 
+        Event sequence emitted to client:
+          conversation_started  — { conversation_id, model_name }
+          plan_created          — { steps: [...] }
+          tool_called           — { tool: {...} }
+          evidence_found        — { source_count: N }
+          auditor_done          — { verdict, top_score }
+          generation_started    — {}
+          token                 — { content: "..." }  ← one per LLM token chunk
+          done                  — full ChatResult payload
+
+        Token events allow clients to render the answer incrementally
+        without waiting for the full completion.
+        """
         accumulated_answer = ""
         citations: list[str] = []
         evidence: list[dict] = []
 
-        async for node_name, node_output in self._agent_runner.run_stream(context, correlation_id):
-            if node_name == ROUTER_NODE:
-                yield "conversation_started", {
-                    "conversation_id": context.conversation_id,
-                    "model_name": context.model_name,
-                }
-            elif node_name == PLANNER_NODE:
-                yield "plan_created", {"steps": node_output.get("plan_steps", [])}
-            elif node_name == EXECUTOR_NODE:
-                executed = node_output.get("executed_steps", [])
-                if executed:
-                    yield "tool_called", {"tool": executed[-1].get("tool_call", {})}
-                # Accumulate evidence from each executor output
-                node_evidence = node_output.get("evidence", [])
-                if node_evidence:
-                    evidence = node_evidence  # replace with latest full state
-                    yield "evidence_found", {"source_count": len(evidence)}
-            elif node_name == GENERATOR_NODE:
-                yield "generation_started", {}
-                accumulated_answer = node_output.get("final_answer", "")
-                citations = node_output.get("citations", [])
+        async for event_type, payload in self._agent_runner.run_stream(context, correlation_id):
+            if event_type == "generation_done":
+                # Capture final state from generator, do not forward to client yet
+                accumulated_answer = payload.get("final_answer", "")
+                citations = payload.get("citations", [])
+                evidence = payload.get("evidence", [])
+            else:
+                # Forward all other events (status + token chunks) directly to client
+                yield event_type, payload
 
-        # Build deduplicated sources from final evidence + citations
+        # Build deduplicated structured sources
         sources = _build_sources(evidence=evidence, citations=citations)
 
         saved_msg = await self._message_repo.save_assistant_message(

@@ -19,7 +19,14 @@ FAKE_RESULT = ChatResult(
     conversation_id=CONV_ID,
     message_id=str(uuid.uuid4()),
     answer="Wanprestasi adalah kegagalan memenuhi kewajiban kontrak.",
-    sources=["chunk-1"],
+    sources=[
+        {
+            "chunk_id": "test-chunk-uuid-1",
+            "document_id": "test-doc-uuid-1",
+            "score": 0.95,
+            "preview": "Wanprestasi adalah kegagalan memenuhi kewajiban kontrak.",
+        }
+    ],
     model_name="qwen/qwen-turbo",
     system_prompt_id=None,
     created_at=datetime.now(timezone.utc),

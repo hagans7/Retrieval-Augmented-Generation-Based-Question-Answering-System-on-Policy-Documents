@@ -1,4 +1,3 @@
-
 """
 Agent runner — builds and invokes the LangGraph agentic orchestration graph.
 
@@ -53,6 +52,7 @@ from src.prompts.agents import (
     planner_prompt,
     router_prompt,
 )
+from src.interfaces.clients.base_observability_client import BaseObservabilityClient
 from src.services.process_chat.context_builder import ChatContext
 
 logger = get_logger(__name__)
@@ -109,12 +109,20 @@ class AgentRunner:
         graph_client: BaseGraphClient,
         embedding_client: BaseEmbeddingClient,
         reranker_client: BaseRerankerClient,
+        observability_client: BaseObservabilityClient | None = None,
     ) -> None:
         self._llm = llm_client
         self._vector = vector_client
         self._graph = graph_client
         self._embedding = embedding_client
         self._reranker = reranker_client
+        # If None (e.g. in tests that don't inject one), fall back to no-op
+        if observability_client is None:
+            from src.core.observability.noop_client import NoOpObservabilityClient
+            observability_client = NoOpObservabilityClient()
+        self._obs: BaseObservabilityClient = observability_client
+        # Maps correlation_id → active trace object for node-level span access
+        self._active_traces: dict[str, object] = {}
 
     def _build_graph(self) -> Any:
         """Construct and compile the LangGraph StateGraph."""
@@ -142,16 +150,21 @@ class AgentRunner:
 
     async def _router_node(self, state: AgentState) -> dict:
         """Classify query into simple/retrieval/graph/hybrid."""
+        trace = self._active_traces.get(state["correlation_id"])
         messages = [
             {"role": "system", "content": router_prompt.SYSTEM_PROMPT},
             {"role": "user", "content": state["user_message"]},
         ]
+        gen = self._obs.start_generation(trace, "router_llm",
+            model=state["model_name"], input=messages,
+            metadata={"node": "router"})
         result = await self._llm.generate_with_tool_call(
             messages=messages,
             model=state["model_name"],
             tools=router_prompt.TOOL_SCHEMA,
         )
         query_type = (result or {}).get("query_type", "retrieval")
+        self._obs.end_generation(gen, output=result, metadata={"query_type": query_type})
         logger.debug(
             "Router classified query",
             extra={"query_type": query_type, "conversation_id": state["conversation_id"]},
@@ -194,11 +207,17 @@ class AgentRunner:
             {"role": "system", "content": executor_prompt.SYSTEM_PROMPT},
             {"role": "user", "content": f"Langkah: {current_step}"},
         ]
+        trace = self._active_traces.get(state["correlation_id"])
+        gen = self._obs.start_generation(trace, "executor_llm",
+            model=state["model_name"], input=messages,
+            metadata={"node": "executor", "step": idx})
         tool_call = await self._llm.generate_with_tool_call(
             messages=messages,
             model=state["model_name"],
             tools=executor_prompt.TOOL_SCHEMA,
         )
+        self._obs.end_generation(gen, output=tool_call,
+            metadata={"step": idx, "has_tool_call": tool_call is not None})
 
         evidence: list[dict] = list(state.get("evidence", []))
         seen_hashes: list[str] = list(state.get("seen_hashes", []))
@@ -206,6 +225,8 @@ class AgentRunner:
         new_evidence_count = 0
 
         if tool_call:
+            retrieval_span = self._obs.start_span(trace, "retrieval",
+                input={"tool_call": tool_call, "query": state["user_message"]})
             raw_results = await self._dispatch_tool(tool_call, state["user_message"])
 
             for item in raw_results:
@@ -219,7 +240,6 @@ class AgentRunner:
                     "score": item.get("score", 0.0),
                     "source": item.get("source", "vector"),
                     "chunk_id": item.get("chunk_id", ""),
-                    "document_id": item.get("document_id", ""),
                     "_hash": h,
                 }
 
@@ -238,6 +258,10 @@ class AgentRunner:
                         seen_hashes.append(h)
                         new_evidence_count += 1
 
+            self._obs.end_span(retrieval_span, output={
+                "raw_results_count": len(raw_results),
+                "evidence_added": new_evidence_count,
+            })
             executed.append({
                 "step": current_step,
                 "tool_call": tool_call,
@@ -288,6 +312,11 @@ class AgentRunner:
             {"role": "system", "content": system_content},
             {"role": "user", "content": "Evaluasi evidence di atas."},
         ]
+        trace = self._active_traces.get(state["correlation_id"])
+        gen = self._obs.start_generation(trace, "auditor_llm",
+            model=state["model_name"], input=messages,
+            metadata={"node": "auditor", "loop_count": loop_count,
+                      "evidence_count": len(evidence)})
         result = await self._llm.generate_with_tool_call(
             messages=messages,
             model=state["model_name"],
@@ -296,8 +325,17 @@ class AgentRunner:
 
         verdict = (result or {}).get("verdict", "sufficient")
         top_score = (result or {}).get("top_evidence_score", state.get("top_evidence_score", 0.0))
-
         new_retry_count = loop_count + (1 if verdict == "retry" else 0)
+
+        self._obs.end_generation(gen, output=result, metadata={
+            "verdict": verdict, "top_score": top_score, "loop_count": loop_count,
+        })
+        self._obs.log_event(trace, "auditor_decision",
+            input={"evidence_count": len(evidence), "loop_count": loop_count},
+            output={"verdict": verdict, "top_score": top_score},
+        )
+        self._obs.score_trace(trace, name="auditor_evidence_score",
+                              value=top_score, comment=f"loop={loop_count} verdict={verdict}")
 
         logger.debug(
             "Auditor verdict",
@@ -370,6 +408,12 @@ class AgentRunner:
             + [{"role": "user", "content": state["user_message"]}]
         )
 
+        trace = self._active_traces.get(state["correlation_id"])
+        gen = self._obs.start_generation(trace, "generator_llm",
+            model=state["model_name"], input=messages,
+            metadata={"node": "generator", "evidence_count": evidence_count,
+                      "top_score": top_score})
+
         # Attempt structured tool call first
         result = await self._llm.generate_with_tool_call(
             messages=messages,
@@ -381,6 +425,9 @@ class AgentRunner:
             answer = result.get("answer", "")
             citations = result.get("citations", [])
             confidence = result.get("confidence", "low")
+            self._obs.end_generation(gen, output=result,
+                metadata={"tool_call_success": True, "confidence": confidence,
+                          "citations_count": len(citations)})
         else:
             # Fallback: plain text generation
             logger.debug(
@@ -392,12 +439,12 @@ class AgentRunner:
                 model=state["model_name"],
             )
             confidence = "medium"
-            # Citations fallback: use top-scored evidence indices as source references
-            # This ensures sources is never empty when evidence exists
             citations = [
                 str(i)
                 for i, _ in enumerate(sorted_evidence[:5], 1)
             ] if sorted_evidence else []
+            self._obs.end_generation(gen, output={"answer": answer[:300]},
+                metadata={"tool_call_success": False, "fallback": "generate()"})
 
         return {"final_answer": answer, "citations": citations, "confidence": confidence}
 
@@ -557,20 +604,160 @@ class AgentRunner:
               - confidence: str
               - evidence: list[dict]  — full evidence items for source extraction
         """
-        graph = self._build_graph()
-        final_state = await graph.ainvoke(self._make_initial_state(context, correlation_id))
-        return {
-            "final_answer": final_state.get("final_answer", ""),
-            "citations": final_state.get("citations", []),
-            "confidence": final_state.get("confidence", ""),
-            "evidence": final_state.get("evidence", []),
-        }
+        obs = self._obs
+
+        # ── Langfuse: top-level trace for this request ────────────────────────
+        trace = obs.start_trace(
+            name="chat_request",
+            session_id=context.conversation_id,
+            input={
+                "query": context.user_message,
+                "model": context.model_name,
+            },
+            metadata={"correlation_id": correlation_id},
+            tags=["non-stream", "kartika"],
+        )
+        self._active_traces[correlation_id] = trace
+
+        try:
+            graph = self._build_graph()
+            final_state = await graph.ainvoke(self._make_initial_state(context, correlation_id))
+
+            result = {
+                "final_answer": final_state.get("final_answer", ""),
+                "citations": final_state.get("citations", []),
+                "confidence": final_state.get("confidence", ""),
+                "evidence": final_state.get("evidence", []),
+            }
+
+            # ── Langfuse: end trace with answer summary ───────────────────────
+            evidence = result["evidence"]
+            top_score = max((e.get("score", 0.0) for e in evidence), default=0.0)
+            obs.end_trace(trace, output={
+                "answer_preview": result["final_answer"][:200],
+                "citations_count": len(result["citations"]),
+                "evidence_count": len(evidence),
+                "top_reranker_score": round(top_score, 4),
+                "confidence": result["confidence"],
+            })
+            obs.score_trace(trace, name="top_evidence_score", value=top_score,
+                            comment="Reranker score of best evidence chunk")
+            obs.flush()
+            self._active_traces.pop(correlation_id, None)
+            return result
+
+        except Exception as exc:
+            obs.log_event(trace, "agent_error",
+                          output={"error": str(exc)}, level="ERROR")
+            obs.flush()
+            self._active_traces.pop(correlation_id, None)
+            raise
 
     async def run_stream(
         self, context: ChatContext, correlation_id: str
     ) -> AsyncIterator[tuple[str, dict]]:
-        """Run in stream mode, yielding (node_name, node_output) tuples."""
+        """
+        Run in stream mode.
+
+        Yields (event_type, payload) tuples:
+          - Status events from agent nodes: conversation_started, plan_created,
+            tool_called, evidence_found, auditor_done
+          - Token events from generator: ("token", {"content": "..."})
+            emitted per-chunk as the LLM generates text
+          - Final event: ("generation_done", {"citations", "confidence", "evidence"})
+
+        The generator step bypasses LangGraph and calls generate_stream()
+        directly so tokens arrive incrementally without waiting for full completion.
+        """
+        from src.core.constants.agent import AUDITOR_NODE, EXECUTOR_NODE, PLANNER_NODE, ROUTER_NODE
+
+        # ── Phase 1: Run ROUTER → PLANNER → EXECUTOR → AUDITOR via LangGraph ──
+        # Build a graph that stops before GENERATOR so we can stream tokens manually
         graph = self._build_graph()
+        final_pre_gen_state: dict = {}
+
         async for event in graph.astream(self._make_initial_state(context, correlation_id)):
             for node_name, node_output in event.items():
-                yield node_name, node_output
+
+                if node_name == ROUTER_NODE:
+                    yield "conversation_started", {
+                        "conversation_id": context.conversation_id,
+                        "model_name": context.model_name,
+                    }
+
+                elif node_name == PLANNER_NODE:
+                    yield "plan_created", {"steps": node_output.get("plan_steps", [])}
+
+                elif node_name == EXECUTOR_NODE:
+                    executed = node_output.get("executed_steps", [])
+                    if executed:
+                        yield "tool_called", {"tool": executed[-1].get("tool_call", {})}
+                    if node_output.get("evidence"):
+                        yield "evidence_found", {"source_count": len(node_output["evidence"])}
+
+                elif node_name == AUDITOR_NODE:
+                    yield "auditor_done", {
+                        "verdict": node_output.get("audit_verdict", ""),
+                        "top_score": node_output.get("top_evidence_score", 0.0),
+                    }
+
+                # Accumulate final state (LangGraph merges state across nodes)
+                final_pre_gen_state.update(node_output)
+
+        # ── Phase 2: Generator — stream tokens directly ──────────────────────
+        # Build generator prompt from accumulated state (same logic as _generator_node)
+        evidence = final_pre_gen_state.get("evidence", [])
+        sorted_evidence = sorted(evidence, key=lambda e: e.get("score", 0.0), reverse=True)
+
+        evidence_blocks = []
+        for i, e in enumerate(sorted_evidence[:12], 1):
+            score = e.get("score", 0.0)
+            content = e.get("content", "")
+            source = e.get("source", "")
+            evidence_blocks.append(f"[{i}] (relevance={score:.3f}, source={source})\n{content}")
+
+        evidence_context = "\n\n".join(evidence_blocks) if evidence_blocks else "Tidak ada evidence."
+
+        top_score = final_pre_gen_state.get("top_evidence_score", 0.0)
+        ev_count = len(evidence)
+        if ev_count == 0:
+            quality_summary = "Tidak ada evidence — jawab bahwa informasi tidak tersedia."
+        elif top_score >= 0.7:
+            quality_summary = f"{ev_count} evidence tersedia. Skor tertinggi: {top_score:.3f} (tinggi)."
+        elif top_score >= 0.4:
+            quality_summary = f"{ev_count} evidence tersedia. Skor tertinggi: {top_score:.3f} (sedang)."
+        else:
+            quality_summary = f"{ev_count} evidence tersedia. Skor tertinggi: {top_score:.3f} (rendah)."
+
+        from src.prompts.agents import generator_prompt
+        system_content = generator_prompt.SYSTEM_PROMPT_TEMPLATE.format(
+            user_system_prompt=context.user_system_prompt or "",
+            evidence_context=evidence_context,
+            evidence_quality_summary=quality_summary,
+        )
+        messages = (
+            [{"role": "system", "content": system_content}]
+            + context.chat_history
+            + [{"role": "user", "content": context.user_message}]
+        )
+
+        # Stream tokens — each chunk emitted immediately as LLM generates
+        accumulated_answer = ""
+        yield "generation_started", {}
+
+        async for token in self._llm.generate_stream(
+            messages=messages,
+            model=context.model_name,
+        ):
+            accumulated_answer += token
+            yield "token", {"content": token}
+
+        # Citations fallback from evidence indices (no tool call in stream mode)
+        citations = [str(i) for i, _ in enumerate(sorted_evidence[:5], 1)] if sorted_evidence else []
+
+        yield "generation_done", {
+            "final_answer": accumulated_answer,
+            "citations": citations,
+            "confidence": "medium",
+            "evidence": evidence,
+        }
